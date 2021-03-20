@@ -192,8 +192,7 @@ pub extern "C" fn rustls_server_config_builder_set_protocols(
 /// be used in multiple configs.
 ///
 /// EXPERIMENTAL: installing a client_hello callback will replace any
-/// configured certified keys and vice versa. Same holds true for the
-/// set_single_cert variant.
+/// configured certified keys and vice versa.
 #[no_mangle]
 pub extern "C" fn rustls_server_config_builder_set_certified_keys(
     builder: *mut rustls_server_config_builder,
