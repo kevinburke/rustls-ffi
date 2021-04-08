@@ -19,6 +19,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <errno.h>
+#include <errno.h>
+#include <pthread.h>
 
 #ifdef _WIN32
 #define sleep(s) Sleep(1000 * (s))
@@ -720,6 +722,17 @@ handshake(int sockfd, struct rustls_server_session *config)
 {
 }
 
+typedef struct conndata_t {
+  int fd;
+} conndata_t;
+
+void *
+handle_conn(void *userdata) {
+  conndata_t *conn = userdata;
+  fprintf(stderr, "accepted conn on fd %d\n", conn->fd);
+  return NULL;
+}
+
 int
 main(int argc, const char **argv)
 {
@@ -808,9 +821,18 @@ main(int argc, const char **argv)
     goto cleanup;
   }
 
-  fprintf(stderr, "accepted connection from client");
-  result = handshake(sockfd, server_session);
-  if(result != CRUSTLS_DEMO_OK) {
+  pthread_t thrd;
+  conndata_t *conndata;
+  conndata = malloc(sizeof(conndata_t));
+  conndata->fd = clientfd;
+  ret = pthread_create(&thrd, NULL, handle_conn, conndata);
+  if (ret != 0) {
+    fprintf(stderr, "error from pthread_create: %d\n", ret);
+    goto cleanup;
+  }
+  pthread_join(thrd, NULL);
+  if (ret != 0) {
+    fprintf(stderr, "error from pthread_join: %d\n", ret);
     goto cleanup;
   }
 
