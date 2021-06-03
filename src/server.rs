@@ -1,27 +1,34 @@
-use libc::size_t;
 use std::convert::TryInto;
 use std::ffi::c_void;
-use std::io::{Cursor, Read, Write};
+use std::ptr::null_mut;
 use std::slice;
 use std::sync::Arc;
 
+use libc::size_t;
 use rustls::sign::CertifiedKey;
-use rustls::ResolvesServerCert;
-use rustls::{ClientHello, NoClientAuth, ServerConfig, ServerSession, Session};
-use rustls_result::NullParameter;
+use rustls::{
+    AllowAnyAnonymousOrAuthenticatedClient, AllowAnyAuthenticatedClient, ClientHello, NoClientAuth,
+    ServerConfig, ServerSession,
+};
+use rustls::{ResolvesServerCert, ALL_CIPHERSUITES};
+use rustls::{SignatureScheme, SupportedCipherSuite};
 
-use crate::cipher::rustls_certified_key;
+use crate::cipher::{
+    rustls_certified_key, rustls_client_cert_verifier, rustls_client_cert_verifier_optional,
+    rustls_supported_ciphersuite,
+};
+use crate::connection::{rustls_connection, Connection};
 use crate::enums::rustls_tls_version_from_u16;
-use crate::error::{map_error, rustls_result};
+use crate::error::rustls_result;
+use crate::error::rustls_result::{InvalidParameter, NullParameter};
 use crate::rslice::{rustls_slice_bytes, rustls_slice_slice_bytes, rustls_slice_u16, rustls_str};
 use crate::session::{
-    rustls_session_store_get_callback, rustls_session_store_put_callback,
-    rustls_session_store_userdata, SessionStoreBroker, SessionStoreGetCallback,
-    SessionStorePutCallback,
+    rustls_session_store_get_callback, rustls_session_store_put_callback, SessionStoreBroker,
+    SessionStoreGetCallback, SessionStorePutCallback,
 };
 use crate::{
-    arc_with_incref_from_raw, ffi_panic_boundary, is_close_notify, try_mut_from_ptr, try_mut_slice,
-    try_ref_from_ptr, try_slice, CastPtr,
+    arc_with_incref_from_raw, ffi_panic_boundary, try_mut_from_ptr, try_mut_slice,
+    try_ref_from_ptr, try_slice, userdata_get, CastPtr,
 };
 
 /// A server config being constructed. A builder can be modified by,
@@ -56,19 +63,9 @@ impl CastPtr for rustls_server_config {
     type RustType = ServerConfig;
 }
 
-pub struct rustls_server_session {
-    _private: [u8; 0],
-}
-
-impl CastPtr for rustls_server_session {
-    type RustType = ServerSession;
-}
-
 /// Create a rustls_server_config_builder. Caller owns the memory and must
 /// eventually call rustls_server_config_builder_build, then free the
-/// resulting rustls_server_config. This starts out with no trusted roots.
-/// Caller must add roots with rustls_server_config_builder_load_native_roots
-/// or rustls_server_config_builder_load_roots_from_file.
+/// resulting rustls_server_config.
 /// https://docs.rs/rustls/0.19.0/rustls/struct.ServerConfig.html#method.new
 #[no_mangle]
 pub extern "C" fn rustls_server_config_builder_new() -> *mut rustls_server_config_builder {
@@ -76,6 +73,50 @@ pub extern "C" fn rustls_server_config_builder_new() -> *mut rustls_server_confi
         let config = rustls::ServerConfig::new(Arc::new(NoClientAuth));
         let b = Box::new(config);
         Box::into_raw(b) as *mut _
+    }
+}
+
+/// Create a rustls_server_config_builder for TLS sessions that require
+/// valid client certificates. The passed rustls_client_cert_verifier may
+/// be used in several builders.
+/// If input is NULL, this will return NULL.
+/// For memory lifetime, see rustls_server_config_builder_new.
+#[no_mangle]
+pub extern "C" fn rustls_server_config_builder_with_client_verifier(
+    verifier: *const rustls_client_cert_verifier,
+) -> *mut rustls_server_config_builder {
+    ffi_panic_boundary! {
+        let verifier: Arc<AllowAnyAuthenticatedClient> = unsafe {
+            match (verifier as *const AllowAnyAuthenticatedClient).as_ref() {
+                Some(c) => arc_with_incref_from_raw(c),
+                None => return null_mut(),
+            }
+        };
+        let config = rustls::ServerConfig::new(verifier);
+        let b = Box::new(config);
+        Box::into_raw(b) as *mut rustls_server_config_builder
+    }
+}
+
+/// Create a rustls_server_config_builder for TLS sessions that accept
+/// valid client certificates, but do not require them. The passed
+/// rustls_client_cert_verifier_optional may be used in several builders.
+/// If input is NULL, this will return NULL.
+/// For memory lifetime, see rustls_server_config_builder_new.
+#[no_mangle]
+pub extern "C" fn rustls_server_config_builder_with_client_verifier_optional(
+    verifier: *const rustls_client_cert_verifier_optional,
+) -> *mut rustls_server_config_builder {
+    ffi_panic_boundary! {
+        let verifier: Arc<AllowAnyAnonymousOrAuthenticatedClient> = unsafe {
+            match (verifier as *const AllowAnyAnonymousOrAuthenticatedClient).as_ref() {
+                Some(c) => arc_with_incref_from_raw(c),
+                None => return null_mut(),
+            }
+        };
+        let config = rustls::ServerConfig::new(verifier);
+        let b = Box::new(config);
+        Box::into_raw(b) as *mut rustls_server_config_builder
     }
 }
 
@@ -181,6 +222,33 @@ pub extern "C" fn rustls_server_config_builder_set_protocols(
     }
 }
 
+/// Set the cipher suite list, in preference order. The `ciphersuites`
+/// parameter must point to an array containing `len` pointers to
+/// `rustls_supported_ciphersuite` previously obtained from
+/// `rustls_all_ciphersuites_get()`.
+/// https://docs.rs/rustls/0.19.0/rustls/struct.ServerConfig.html#structfield.ciphersuites
+#[no_mangle]
+pub extern "C" fn rustls_server_config_builder_set_ciphersuites(
+    builder: *mut rustls_server_config_builder,
+    ciphersuites: *const *const rustls_supported_ciphersuite,
+    len: size_t,
+) -> rustls_result {
+    ffi_panic_boundary! {
+        let config: &mut ServerConfig = try_mut_from_ptr!(builder);
+        let ciphersuites: &[*const rustls_supported_ciphersuite] = try_slice!(ciphersuites, len);
+        let mut cs_vec: Vec<&'static SupportedCipherSuite> = Vec::new();
+        for &cs in ciphersuites.into_iter() {
+            let cs = try_ref_from_ptr!(cs);
+            match ALL_CIPHERSUITES.iter().find(|&acs| cs.eq(acs)) {
+                Some(scs) => cs_vec.push(scs),
+                None => return InvalidParameter,
+            }
+        }
+        config.ciphersuites = cs_vec;
+        rustls_result::Ok
+    }
+}
+
 /// Provide the configuration a list of certificates where the session
 /// will select the first one that is compatible with the client's signature
 /// verification capabilities. Servers that want to support both ECDSA and
@@ -233,7 +301,7 @@ pub extern "C" fn rustls_server_config_builder_build(
 
 /// "Free" a server_config previously returned from
 /// rustls_server_config_builder_build. Since server_config is actually an
-/// atomically reference-counted pointer, extant server_sessions may still
+/// atomically reference-counted pointer, extant server connections may still
 /// hold an internal reference to the Rust object. However, C code must
 /// consider this pointer unusable after "free"ing it.
 /// Calling with NULL is fine. Must not be called twice with the same value.
@@ -248,15 +316,16 @@ pub extern "C" fn rustls_server_config_free(config: *const rustls_server_config)
     }
 }
 
-/// Create a new rustls::ServerSession, and return it in the output parameter `out`.
-/// If this returns an error code, the memory pointed to by `session_out` remains unchanged.
-/// If this returns a non-error, the memory pointed to by `session_out` is modified to point
-/// at a valid ServerSession. The caller now owns the ServerSession and must call
-/// `rustls_server_session_free` when done with it.
+/// Create a new rustls_connection containing a server connection, and return it
+/// in the output parameter `out`. If this returns an error code, the memory
+/// pointed to by `session_out` remains unchanged. If this returns a non-error,
+/// the memory pointed to by `session_out` is modified to point
+/// at a valid rustls_connection. The caller now owns the rustls_connection
+/// and must call `rustls_connection_free` when done with it.
 #[no_mangle]
-pub extern "C" fn rustls_server_session_new(
+pub extern "C" fn rustls_server_connection_new(
     config: *const rustls_server_config,
-    session_out: *mut *mut rustls_server_session,
+    conn_out: *mut *mut rustls_connection,
 ) -> rustls_result {
     ffi_panic_boundary! {
         let config: Arc<ServerConfig> = unsafe {
@@ -265,224 +334,16 @@ pub extern "C" fn rustls_server_session_new(
                 None => return NullParameter,
             }
         };
-        let server = ServerSession::new(&config);
 
         // We've succeeded. Put the server on the heap, and transfer ownership
         // to the caller. After this point, we must return CRUSTLS_OK so the
         // caller knows it is responsible for this memory.
-        let b = Box::new(server);
+        let c = Connection::from_server(ServerSession::new(&config));
         unsafe {
-            *session_out = Box::into_raw(b) as *mut _;
+            *conn_out = Box::into_raw(Box::new(c)) as *mut _;
         }
 
         return rustls_result::Ok;
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rustls_server_session_wants_read(session: *const rustls_server_session) -> bool {
-    ffi_panic_boundary! {
-        let session: &ServerSession = try_ref_from_ptr!(session);
-        session.wants_read()
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rustls_server_session_wants_write(session: *const rustls_server_session) -> bool {
-    ffi_panic_boundary! {
-        let session: &ServerSession = try_ref_from_ptr!(session);
-        session.wants_write()
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rustls_server_session_is_handshaking(
-    session: *const rustls_server_session,
-) -> bool {
-    ffi_panic_boundary! {
-        let session: &ServerSession = try_ref_from_ptr!(session);
-        session.is_handshaking()
-    }
-}
-
-/// Return the TLS protocol version that has been negotiated. Before this
-/// has been decided during the handshake, this will return 0. Otherwise,
-/// the u16 version number as defined in the relevant RFC is returned.
-#[no_mangle]
-pub extern "C" fn rustls_server_session_get_protocol_version(
-    session: *const rustls_server_session,
-) -> u16 {
-    ffi_panic_boundary! {
-        let session: &ServerSession = try_ref_from_ptr!(session);
-        match session.get_protocol_version() {
-            Some(v) => v.get_u16(),
-            None => 0
-        }
-    }
-}
-
-#[no_mangle]
-pub extern "C" fn rustls_server_session_process_new_packets(
-    session: *mut rustls_server_session,
-) -> rustls_result {
-    ffi_panic_boundary! {
-        let session: &mut ServerSession = try_mut_from_ptr!(session);
-        match session.process_new_packets() {
-            Ok(()) => rustls_result::Ok,
-            Err(e) => return map_error(e),
-        }
-    }
-}
-
-/// Queues a close_notify fatal alert to be sent in the next write_tls call.
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.send_close_notify
-#[no_mangle]
-pub extern "C" fn rustls_server_session_send_close_notify(session: *mut rustls_server_session) {
-    ffi_panic_boundary! {
-        let session: &mut ServerSession = try_mut_from_ptr!(session);
-        session.send_close_notify()
-    }
-}
-
-/// Free a server_session previously returned from rustls_server_session_new.
-/// Calling with NULL is fine. Must not be called twice with the same value.
-#[no_mangle]
-pub extern "C" fn rustls_server_session_free(session: *mut rustls_server_session) {
-    ffi_panic_boundary! {
-        let session: &mut ServerSession = try_mut_from_ptr!(session);
-        // Convert the pointer to a Box and drop it.
-        unsafe { Box::from_raw(session); }
-    }
-}
-
-/// Write up to `count` plaintext bytes from `buf` into the ServerSession.
-/// This will increase the number of output bytes available to
-/// `rustls_server_session_write_tls`.
-/// On success, store the number of bytes actually written in *out_n
-/// (this may be less than `count`).
-/// https://docs.rs/rustls/0.19.0/rustls/struct.ServerSession.html#method.write
-#[no_mangle]
-pub extern "C" fn rustls_server_session_write(
-    session: *mut rustls_server_session,
-    buf: *const u8,
-    count: size_t,
-    out_n: *mut size_t,
-) -> rustls_result {
-    ffi_panic_boundary! {
-        let session: &mut ServerSession = try_mut_from_ptr!(session);
-        let write_buf: &[u8] = try_slice!(buf, count);
-        let out_n: &mut size_t = unsafe {
-            match out_n.as_mut() {
-                Some(out_n) => out_n,
-                None => return NullParameter,
-            }
-        };
-        let n_written: usize = match session.write(write_buf) {
-            Ok(n) => n,
-            Err(_) => return rustls_result::Io,
-        };
-        *out_n = n_written;
-        rustls_result::Ok
-    }
-}
-
-/// Read up to `count` plaintext bytes from the ServerSession into `buf`.
-/// On success, store the number of bytes read in *out_n (this may be less
-/// than `count`). A success with *out_n set to 0 means "all bytes currently
-/// available have been read, but more bytes may become available after
-/// subsequent calls to rustls_server_session_read_tls and
-/// rustls_server_session_process_new_packets."
-///
-/// Subtle note: Even though this function only writes to `buf` and does not
-/// read from it, the memory in `buf` must be initialized before the call (for
-/// Rust-internal reasons). Initializing a buffer once and then using it
-/// multiple times without zeroizing before each call is fine.
-///
-/// https://docs.rs/rustls/0.19.0/rustls/struct.ServerSession.html#method.read
-#[no_mangle]
-pub extern "C" fn rustls_server_session_read(
-    session: *mut rustls_server_session,
-    buf: *mut u8,
-    count: size_t,
-    out_n: *mut size_t,
-) -> rustls_result {
-    ffi_panic_boundary! {
-        let session: &mut ServerSession = try_mut_from_ptr!(session);
-        let read_buf: &mut [u8] = try_mut_slice!(buf, count);
-        let out_n: &mut size_t = try_mut_from_ptr!(out_n);
-
-        let n_read: usize = match session.read(read_buf) {
-            Ok(n) => n,
-            // Rustls turns close_notify alerts into `io::Error` of kind `ConnectionAborted`.
-            // https://docs.rs/rustls/0.19.0/rustls/struct.ClientSession.html#impl-Read.
-            Err(e) if is_close_notify(&e) => {
-                return rustls_result::AlertCloseNotify;
-            }
-            Err(_) => return rustls_result::Io,
-        };
-        *out_n = n_read;
-        rustls_result::Ok
-    }
-}
-
-/// Read up to `count` TLS bytes from `buf` (usually read from a socket) into
-/// the ServerSession. This may make packets available to
-/// `rustls_server_session_process_new_packets`, which in turn may make more
-/// bytes available to `rustls_server_session_read`.
-/// On success, store the number of bytes actually read in *out_n (this may
-/// be less than `count`). This function returns success and stores 0 in
-/// *out_n when the input count is 0.
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.read_tls
-#[no_mangle]
-pub extern "C" fn rustls_server_session_read_tls(
-    session: *mut rustls_server_session,
-    buf: *const u8,
-    count: size_t,
-    out_n: *mut size_t,
-) -> rustls_result {
-    ffi_panic_boundary! {
-        let session: &mut ServerSession = try_mut_from_ptr!(session);
-        let input_buf: &[u8] = try_slice!(buf, count);
-        let out_n: &mut size_t = try_mut_from_ptr!(out_n);
-
-        let mut cursor = Cursor::new(input_buf);
-        let n_read: usize = match session.read_tls(&mut cursor) {
-            Ok(n) => n,
-            Err(_) => return rustls_result::Io,
-        };
-        *out_n = n_read;
-        rustls_result::Ok
-    }
-}
-
-/// Write up to `count` TLS bytes from the ServerSession into `buf`. Those
-/// bytes should then be written to a socket. On success, store the number of
-/// bytes actually written in *out_n (this maybe less than `count`).
-///
-/// Subtle note: Even though this function only writes to `buf` and does not
-/// read from it, the memory in `buf` must be initialized before the call (for
-/// Rust-internal reasons). Initializing a buffer once and then using it
-/// multiple times without zeroizing before each call is fine.
-///
-/// https://docs.rs/rustls/0.19.0/rustls/trait.Session.html#tymethod.write_tls
-#[no_mangle]
-pub extern "C" fn rustls_server_session_write_tls(
-    session: *mut rustls_server_session,
-    buf: *mut u8,
-    count: size_t,
-    out_n: *mut size_t,
-) -> rustls_result {
-    ffi_panic_boundary! {
-        let session: &mut ServerSession = try_mut_from_ptr!(session);
-        let mut output_buf: &mut [u8] = try_mut_slice!(buf, count);
-        let out_n: &mut size_t = try_mut_from_ptr!(out_n);
-
-        let n_written: usize = match session.write_tls(&mut output_buf) {
-            Ok(n) => n,
-            Err(_) => return rustls_result::Io,
-        };
-        *out_n = n_written;
-        rustls_result::Ok
     }
 }
 
@@ -494,17 +355,21 @@ pub extern "C" fn rustls_server_session_write_tls(
 /// because it hasn't been processed yet, or because the client did not send SNI.
 /// https://docs.rs/rustls/0.19.0/rustls/struct.ServerSession.html#method.get_sni_hostname
 #[no_mangle]
-pub extern "C" fn rustls_server_session_get_sni_hostname(
-    session: *const rustls_server_session,
+pub extern "C" fn rustls_server_connection_get_sni_hostname(
+    conn: *const rustls_connection,
     buf: *mut u8,
     count: size_t,
     out_n: *mut size_t,
 ) -> rustls_result {
     ffi_panic_boundary! {
-        let session: &ServerSession = try_ref_from_ptr!(session);
+        let conn: &Connection = try_ref_from_ptr!(conn);
         let write_buf: &mut [u8] = try_mut_slice!(buf, count);
         let out_n: &mut size_t = try_mut_from_ptr!(out_n);
-        let sni_hostname = match session.get_sni_hostname() {
+        let server_session = match conn.as_server() {
+            Some(s) => s,
+            _ => return rustls_result::InvalidParameter,
+        };
+        let sni_hostname = match server_session.get_sni_hostname() {
             Some(sni_hostname) => sni_hostname,
             None => {
                 return rustls_result::Ok
@@ -569,13 +434,17 @@ pub struct rustls_client_hello<'a> {
     alpn: *const rustls_slice_slice_bytes<'a>,
 }
 
+impl<'a> CastPtr for rustls_client_hello<'a> {
+    type RustType = rustls_client_hello<'a>;
+}
+
 /// Any context information the callback will receive when invoked.
 pub type rustls_client_hello_userdata = *mut c_void;
 
 /// Prototype of a callback that can be installed by the application at the
-/// `rustls_server_config`. This callback will be invoked by a `rustls_server_session`
+/// `rustls_server_config`. This callback will be invoked by a `rustls_connection`
 /// once the TLS client hello message has been received.
-/// `userdata` will be supplied as provided when registering the callback.
+/// `userdata` will be set based on rustls_connection_set_userdata.
 /// `hello` gives the value of the available client announcements, as interpreted
 /// by rustls. See the definition of `rustls_client_hello` for details.
 ///
@@ -584,8 +453,6 @@ pub type rustls_client_hello_userdata = *mut c_void;
 ///   callback invocations.
 /// - the passed callback function must be implemented thread-safe, unless
 ///   there is only a single config and session where it is installed.
-/// - `userdata` must live as long as the config object and any sessions
-///   or other config created from that config object.
 ///
 /// EXPERIMENTAL: this feature of crustls is likely to change in the future, as
 /// the rustls library is re-evaluating their current approach to client hello handling.
@@ -607,15 +474,11 @@ struct ClientHelloResolver {
     /// Implementation of rustls::ResolvesServerCert that passes values
     /// from the supplied ClientHello to the callback function.
     pub callback: ClientHelloCallback,
-    pub userdata: rustls_client_hello_userdata,
 }
 
 impl ClientHelloResolver {
-    pub fn new(
-        callback: ClientHelloCallback,
-        userdata: rustls_client_hello_userdata,
-    ) -> ClientHelloResolver {
-        ClientHelloResolver { callback, userdata }
+    pub fn new(callback: ClientHelloCallback) -> ClientHelloResolver {
+        ClientHelloResolver { callback }
     }
 }
 
@@ -646,7 +509,11 @@ impl ResolvesServerCert for ClientHelloResolver {
             alpn: &alpn,
         };
         let cb = self.callback;
-        let key_ptr: *const rustls_certified_key = unsafe { cb(self.userdata, &hello) };
+        let userdata = match userdata_get() {
+            Ok(u) => u,
+            Err(_) => return None,
+        };
+        let key_ptr: *const rustls_certified_key = unsafe { cb(userdata, &hello) };
         let certified_key: &CertifiedKey = try_ref_from_ptr!(key_ptr);
         Some(certified_key.clone())
     }
@@ -659,13 +526,14 @@ unsafe impl Sync for ClientHelloResolver {}
 unsafe impl Send for ClientHelloResolver {}
 
 /// Register a callback to be invoked when a session created from this config
-/// is seeing a TLS ClientHello message. The given `userdata` will be passed
-/// to the callback when invoked.
+/// is seeing a TLS ClientHello message. If `userdata` has been set with
+/// rustls_connection_set_userdata, it will be passed to the callback.
+/// Otherwise the userdata param passed to the callback will be NULL.
 ///
 /// Any existing `ResolvesServerCert` implementation currently installed in the
 /// `rustls_server_config` will be replaced. This also means registering twice
 /// will overwrite the first registration. It is not permitted to pass a NULL
-/// value for `callback`, but it is possible to have `userdata` as NULL.
+/// value for `callback`.
 ///
 /// EXPERIMENTAL: this feature of crustls is likely to change in the future, as
 /// the rustls library is re-evaluating their current approach to client hello handling.
@@ -675,7 +543,6 @@ unsafe impl Send for ClientHelloResolver {}
 pub extern "C" fn rustls_server_config_builder_set_hello_callback(
     builder: *mut rustls_server_config_builder,
     callback: rustls_client_hello_callback,
-    userdata: rustls_client_hello_userdata,
 ) -> rustls_result {
     ffi_panic_boundary! {
         let callback: ClientHelloCallback = match callback {
@@ -684,9 +551,76 @@ pub extern "C" fn rustls_server_config_builder_set_hello_callback(
         };
         let config: &mut ServerConfig = try_mut_from_ptr!(builder);
         config.cert_resolver = Arc::new(ClientHelloResolver::new(
-            callback, userdata
+            callback
         ));
         rustls_result::Ok
+    }
+}
+
+// Turn a slice of u16's into a vec of SignatureScheme as needed by rustls.
+fn sigschemes(input: &[u16]) -> Vec<SignatureScheme> {
+    use rustls::SignatureScheme::*;
+    input
+        .iter()
+        .map(|n| match n {
+            // TODO: Once rustls 0.20.0+ is released, we can use `.into()` instead of this match.
+            0x0201 => RSA_PKCS1_SHA1,
+            0x0203 => ECDSA_SHA1_Legacy,
+            0x0401 => RSA_PKCS1_SHA256,
+            0x0403 => ECDSA_NISTP256_SHA256,
+            0x0501 => RSA_PKCS1_SHA384,
+            0x0503 => ECDSA_NISTP384_SHA384,
+            0x0601 => RSA_PKCS1_SHA512,
+            0x0603 => ECDSA_NISTP521_SHA512,
+            0x0804 => RSA_PSS_SHA256,
+            0x0805 => RSA_PSS_SHA384,
+            0x0806 => RSA_PSS_SHA512,
+            0x0807 => ED25519,
+            0x0808 => ED448,
+            n => SignatureScheme::Unknown(*n),
+        })
+        .collect()
+}
+
+/// Select a `rustls_certified_key` from the list that matches the cryptographic
+/// parameters of a TLS client hello. Note that this does not do any SNI matching.
+/// The input certificates should already have been filtered to ones matching the
+/// SNI from the client hello.
+///
+/// This is intended for servers that are configured with several keys for the
+/// same domain name(s), for example ECDSA and RSA types. The presented keys are
+/// inspected in the order given and keys first in the list are given preference,
+/// all else being equal. However rustls is free to choose whichever it considers
+/// to be the best key with its knowledge about security issues and possible future
+/// extensions of the protocol.
+///
+/// Return RUSTLS_RESULT_OK if a key was selected and RUSTLS_RESULT_NOT_FOUND
+/// if none was suitable.
+#[no_mangle]
+pub extern "C" fn rustls_client_hello_select_certified_key(
+    hello: *const rustls_client_hello,
+    certified_keys: *const *const rustls_certified_key,
+    certified_keys_len: size_t,
+    out_key: *mut *const rustls_certified_key,
+) -> rustls_result {
+    ffi_panic_boundary! {
+        let hello = try_ref_from_ptr!(hello);
+        let schemes: Vec<SignatureScheme> = sigschemes(try_slice!(hello.signature_schemes.data, hello.signature_schemes.len));
+        let out_key: &mut *const rustls_certified_key = unsafe {
+            match out_key.as_mut() {
+                Some(out_key) => out_key,
+                None => return NullParameter,
+            }
+        };
+        let keys_ptrs: &[*const rustls_certified_key] = try_slice!(certified_keys, certified_keys_len);
+        for &key_ptr in keys_ptrs {
+            let key_ref: &CertifiedKey = try_ref_from_ptr!(key_ptr);
+            if key_ref.key.choose_scheme(&schemes).is_some() {
+                *out_key = key_ptr;
+                return rustls_result::Ok;
+            }
+        }
+        rustls_result::NotFound
     }
 }
 
@@ -694,12 +628,12 @@ pub extern "C" fn rustls_server_config_builder_set_hello_callback(
 /// keys and values are highly sensitive data, containing enough information
 /// to break the security of the sessions involved.
 ///
-/// `userdata` must live as long as the config object and any sessions
-/// or other config created from that config object.
+/// If `userdata` has been set with rustls_connection_set_userdata, it
+/// will be passed to the callbacks. Otherwise the userdata param passed to
+/// the callbacks will be NULL.
 #[no_mangle]
 pub extern "C" fn rustls_server_config_builder_set_persistence(
     builder: *mut rustls_server_config_builder,
-    userdata: rustls_session_store_userdata,
     get_cb: rustls_session_store_get_callback,
     put_cb: rustls_session_store_put_callback,
 ) -> rustls_result {
@@ -714,7 +648,7 @@ pub extern "C" fn rustls_server_config_builder_set_persistence(
         };
         let config: &mut ServerConfig = try_mut_from_ptr!(builder);
         config.set_persistence(Arc::new(SessionStoreBroker::new(
-            userdata, get_cb, put_cb
+            get_cb, put_cb
         )));
         rustls_result::Ok
     }
