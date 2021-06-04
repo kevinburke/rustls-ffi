@@ -435,6 +435,8 @@ typedef struct rustls_client_hello {
  */
 typedef const struct rustls_certified_key *(*rustls_client_hello_callback)(rustls_client_hello_userdata userdata, const struct rustls_client_hello *hello);
 
+void env_logger_init(void);
+
 /**
  * Write the version of the crustls C bindings and rustls itself into the
  * provided buffer, up to a max of `len` bytes. Output is UTF-8 encoded
@@ -996,8 +998,7 @@ enum rustls_result rustls_server_config_builder_set_ciphersuites(struct rustls_s
  * be used in multiple configs.
  *
  * EXPERIMENTAL: installing a client_hello callback will replace any
- * configured certified keys and vice versa. Same holds true for the
- * set_single_cert variant.
+ * configured certified keys and vice versa.
  */
 enum rustls_result rustls_server_config_builder_set_certified_keys(struct rustls_server_config_builder *builder,
                                                                    const struct rustls_certified_key *const *certified_keys,
