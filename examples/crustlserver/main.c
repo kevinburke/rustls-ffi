@@ -59,6 +59,9 @@ enum crustls_demo_result
 typedef struct conndata_t {
   int fd;
   struct rustls_connection *rconn;
+  char *data_from_client;
+  size_t data_len;
+  size_t data_capacity;
 } conndata_t;
 
 void
@@ -200,19 +203,25 @@ write_all(int fd, const char *buf, int n)
  * CRUSTLS_DEMO_CLOSE_NOTIFY for "received close_notify"
  */
 int
-copy_plaintext_to_stdout(struct rustls_connection *client_conn)
+copy_plaintext_to_buffer(struct conndata_t *conn)
 {
   int result;
-  char buf[2048];
   size_t n;
+  struct rustls_connection *rconn = conn->rconn;
 
-  fprintf(stderr, "copy_plaintext_to_stdout\n");
+  if (conn->data_capacity - conn->data_len < 1024) {
+    conn->data_from_client = realloc(conn->data_from_client,
+      conn->data_capacity * 2);
+    if (conn->data_from_client == NULL) {
+      fprintf(stderr, "out of memory\n");
+      abort();
+    }
+  }
 
   for(;;) {
-    fprintf(stderr, "copy_plaintext_to_stdout begin\n");
-    bzero(buf, sizeof(buf));
-    result = rustls_connection_read(
-      client_conn, (uint8_t *)buf, sizeof(buf), &n);
+    char *buf = conn->data_from_client + conn->data_len;
+    size_t avail = conn->data_capacity - conn->data_len;
+    result = rustls_connection_read(rconn, (uint8_t *)buf, avail, &n);
     if(result == RUSTLS_RESULT_ALERT_CLOSE_NOTIFY) {
       fprintf(stderr, "Received close_notify, cleanly ending connection\n");
       return CRUSTLS_DEMO_CLOSE_NOTIFY;
@@ -231,8 +240,6 @@ copy_plaintext_to_stdout(struct rustls_connection *client_conn)
     if(result != 0) {
       return CRUSTLS_DEMO_ERROR;
     }
-
-    fprintf(stderr, "copy_plaintext_to_stdout next\n");
   }
 
   fprintf(stderr, "copy_plaintext_to_stdout: fell through loop\n");
@@ -280,7 +287,7 @@ do_read(struct conndata_t *conn, struct rustls_connection *rconn)
     return CRUSTLS_DEMO_ERROR;
   }
 
-  result = copy_plaintext_to_stdout(rconn);
+  result = copy_plaintext_to_buffer(conn);
   if(result != CRUSTLS_DEMO_CLOSE_NOTIFY) {
     fprintf(stderr, "do_read returning %d\n", result);
     return result;
@@ -481,9 +488,10 @@ main(int argc, const char **argv)
 
     pthread_t thrd;
     conndata_t *conndata;
-    conndata = malloc(sizeof(conndata_t));
+    conndata = calloc(1, sizeof(conndata_t));
     conndata->fd = clientfd;
     conndata->rconn = rconn;
+    conndata->data_from_client = calloc(1, 2048);
     ret = pthread_create(&thrd, NULL, handle_conn, conndata);
     if (ret != 0) {
       fprintf(stderr, "error from pthread_create: %d\n", ret);
