@@ -245,6 +245,10 @@ copy_plaintext_to_buffer(struct conndata_t *conn)
   return CRUSTLS_DEMO_ERROR;
 }
 
+typedef enum exchange_state {
+  READING_REQUEST,
+  SENT_RESPONSE
+} exchange_state;
 
 /*
  * Do one read from the socket, and process all resulting bytes into the
@@ -306,7 +310,6 @@ do_read(struct conndata_t *conn, struct rustls_connection *rconn)
 bool
 request_is_finished(struct conndata_t *conn) {
    conn->data_from_client[conn->data_len] = 0;
-   fprintf(stderr, "current buffer: %s\n", conn->data_from_client);
    return strstr(conn->data_from_client, "\r\n\r\n") != NULL;
 }
 
@@ -335,6 +338,7 @@ handle_conn(void *userdata) {
   struct rustls_connection *rconn = conn->rconn;
   int sockfd = conn->fd;
   struct timespec ts;
+  enum exchange_state state = READING_REQUEST;
 
   fprintf(stderr, "accepted conn on fd %d\n", conn->fd);
 
@@ -348,7 +352,6 @@ handle_conn(void *userdata) {
       FD_SET(sockfd, &write_fds);
     }
 
-    fprintf(stderr, "going into select\n");
     result = select(sockfd + 1, &read_fds, &write_fds, NULL, NULL);
     if(result == -1) {
       perror("select");
@@ -360,7 +363,6 @@ handle_conn(void *userdata) {
       ts.tv_nsec = 1000000000;
       nanosleep(&ts, NULL);
     }
-    fprintf(stderr, "done with select: %d\n", result);
 
     if(FD_ISSET(sockfd, &read_fds)) {
       fprintf(stderr,
@@ -396,8 +398,8 @@ handle_conn(void *userdata) {
       }
     }
 
-    fprintf(stderr, "request_is_finished?\n");
-    if (request_is_finished(conn)) {
+    if (state == READING_REQUEST && request_is_finished(conn)) {
+      state = SENT_RESPONSE;
       fprintf(stderr, "writing response\n");
       send_response(conn);
     }
