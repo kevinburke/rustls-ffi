@@ -47,12 +47,10 @@ const char *ws_strerror (int err)
 #endif
 
 /*
- * Write n bytes from buf to the provided fd, retrying short writes until
+ * Write n bytes from buf to the provided fd (on Windows, this must be
+ * stdout/stderr or a file, not a socket), retrying short writes until
  * we finish or hit an error. Assumes fd is blocking and therefore doesn't
  * handle EAGAIN. Returns 0 for success or 1 for error.
- *
- * For Winsock we cannot use a socket-fd in write().
- * Call send() if fd > STDOUT_FILENO.
  */
 int
 write_all(int fd, const char *buf, int n)

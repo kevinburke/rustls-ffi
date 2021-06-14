@@ -5,10 +5,10 @@ else
 
 endif
 
+CFLAGS := -Werror -Wall -Wextra -Wpedantic -g -I src/
+
 PROFILE := debug
 DESTDIR=/usr/local
-
-CFLAGS := -Werror -Wall -Wextra -Wpedantic -g -I src/
 
 ifeq ($(CC), clang)
 	CFLAGS += -fsanitize=address -fsanitize=undefined
