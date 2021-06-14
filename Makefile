@@ -5,10 +5,10 @@ else
 
 endif
 
-CFLAGS := -Werror -Wall -Wextra -Wpedantic -g
-
 PROFILE := debug
 DESTDIR=/usr/local
+
+CFLAGS := -Werror -Wall -Wextra -Wpedantic -g -I src/
 
 ifeq ($(CC), clang)
 	CFLAGS += -fsanitize=address -fsanitize=undefined
@@ -24,7 +24,7 @@ all: target/crustls-demo
 
 test: all
 	cargo test
-	target/crustls-demo httpbin.org /headers
+	target/client httpbin.org 443 /headers
 
 target:
 	mkdir -p $@
@@ -33,14 +33,17 @@ src/crustls.h: src/*.rs cbindgen.toml
 	cargo check
 	cbindgen --lang C > $@
 
-target/crustls-demo: target/main.o target/$(PROFILE)/libcrustls.a
-	$(CC) -o $@ $^ $(LDFLAGS)
-
 target/$(PROFILE)/libcrustls.a: src/*.rs Cargo.toml
 	cargo build $(CARGOFLAGS)
 
-target/main.o: src/main.c src/crustls.h | target
+target/%.o: tests/%.c src/crustls.h tests/common.h
 	$(CC) -o $@ -c $< $(CFLAGS)
+
+target/client: target/client.o target/common.o target/$(PROFILE)/libcrustls.a
+	$(CC) -o $@ $^ $(LDFLAGS)
+
+target/server: target/server.o target/common.o target/$(PROFILE)/libcrustls.a
+	$(CC) -o $@ $^ $(LDFLAGS)
 
 install: target/$(PROFILE)/libcrustls.a src/crustls.h
 	mkdir -p $(DESTDIR)/lib
