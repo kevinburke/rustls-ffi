@@ -132,6 +132,23 @@ write_cb(void *userdata, const uint8_t *buf, uintptr_t len, uintptr_t *out_n)
   return 0;
 }
 
+size_t
+bytevec_available(struct bytevec *vec)
+{
+  return vec->capacity - vec->len;
+}
+
+char *
+bytevec_writeable(struct bytevec *vec)
+{
+  return vec->data + vec->len;
+}
+
+void
+bytevec_consume(struct bytevec *vec, size_t n) {
+  vec->len += n;
+}
+
 // Ensure there are at least n bytes available between vec->len and
 // vec->capacity. If this requires reallocating, this may return
 // CRUSTLS_DEMO_ERROR.
@@ -156,23 +173,6 @@ bytevec_ensure_available(struct bytevec *vec, size_t n)
     }
   }
   return CRUSTLS_DEMO_OK;
-}
-
-size_t
-bytevec_available(struct bytevec *vec)
-{
-  return vec->capacity - vec->len;
-}
-
-char *
-bytevec_writeable(struct bytevec *vec)
-{
-  return vec->data + vec->len;
-}
-
-void
-bytevec_consume(struct bytevec *vec, size_t n) {
-  vec->len += n;
 }
 
 int

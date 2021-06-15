@@ -343,7 +343,6 @@ macro_rules! try_callback {
         }
     };
 }
-
 /// Write the version of the crustls C bindings and rustls itself into the
 /// provided buffer, up to a max of `len` bytes. Output is UTF-8 encoded
 /// and NUL terminated. Returns the number of bytes written before the NUL.
