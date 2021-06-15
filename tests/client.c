@@ -126,7 +126,7 @@ copy_plaintext_to_stdout(struct rustls_connection *client_conn)
       return CRUSTLS_DEMO_CLOSE_NOTIFY;
     }
     if(result != RUSTLS_RESULT_OK) {
-      fprintf(stderr, "Error in ClientSession::read\n");
+      fprintf(stderr, "Error in rustls_connection_read: %d\n", result);
       return CRUSTLS_DEMO_ERROR;
     }
     if(n == 0) {
@@ -155,13 +155,13 @@ copy_plaintext_to_stdout(struct rustls_connection *client_conn)
  *  - CRUSTLS_DEMO_ERROR for other errors.
  */
 enum crustls_demo_result
-do_read(struct conndata_t *conn, struct rustls_connection *client_conn)
+do_read(struct conndata_t *conn, struct rustls_connection *rconn)
 {
   int err = 1;
   int result = 1;
   size_t n = 0;
 
-  err = rustls_connection_read_tls(client_conn, read_cb, conn, &n);
+  err = rustls_connection_read_tls(rconn, read_cb, conn, &n);
 
   if(err == EAGAIN || err == EWOULDBLOCK) {
     fprintf(stderr,
@@ -174,13 +174,13 @@ do_read(struct conndata_t *conn, struct rustls_connection *client_conn)
     return CRUSTLS_DEMO_ERROR;
   }
 
-  result = rustls_connection_process_new_packets(client_conn);
+  result = rustls_connection_process_new_packets(rconn);
   if(result != RUSTLS_RESULT_OK) {
     print_error("in process_new_packets", result);
     return CRUSTLS_DEMO_ERROR;
   }
 
-  result = copy_plaintext_to_stdout(client_conn);
+  result = copy_plaintext_to_buffer(conn);
   if(result != CRUSTLS_DEMO_CLOSE_NOTIFY) {
     return result;
   }
@@ -188,7 +188,7 @@ do_read(struct conndata_t *conn, struct rustls_connection *client_conn)
   char buf[2048];
   /* If we got a close_notify, verify that the sender then
    * closed the TCP connection. */
-  n = read(conn->fd, buf, sizeof(buf));
+  n = recv(conn->fd, buf, sizeof(buf), 0);
   if(n != 0 && errno != EWOULDBLOCK) {
     fprintf(stderr, "read returned %ld after receiving close_notify: %s\n", n, strerror(errno));
     return CRUSTLS_DEMO_ERROR;
@@ -203,7 +203,7 @@ do_read(struct conndata_t *conn, struct rustls_connection *client_conn)
  */
 int
 send_request_and_read_response(struct conndata_t *conn,
-                               struct rustls_connection *client_conn,
+                               struct rustls_connection *rconn,
                                const char *hostname, const char *path)
 {
   int sockfd = conn->fd;
@@ -214,6 +214,9 @@ send_request_and_read_response(struct conndata_t *conn,
   fd_set read_fds;
   fd_set write_fds;
   size_t n = 0;
+  const char *body, *contentlengthstr, *contentlengthend;
+  unsigned long contentlength;
+  size_t headerslen = 0;
 
   bzero(buf, sizeof(buf));
   snprintf(buf,
@@ -227,21 +230,25 @@ send_request_and_read_response(struct conndata_t *conn,
            path,
            hostname);
   result = rustls_connection_write(
-    client_conn, (uint8_t *)buf, strlen(buf), &n);
+    rconn, (uint8_t *)buf, strlen(buf), &n);
   if(result != RUSTLS_RESULT_OK) {
-    fprintf(stderr, "error writing plaintext bytes to ClientSession\n");
+    fprintf(stderr, "error writing plaintext bytes to rustls_connection\n");
     goto cleanup;
   }
   if(n != strlen(buf)) {
-    fprintf(stderr, "short write writing plaintext bytes to ClientSession\n");
+    fprintf(stderr, "short write writing plaintext bytes to rustls_connection\n");
     goto cleanup;
   }
 
   for(;;) {
     FD_ZERO(&read_fds);
-    FD_SET(sockfd, &read_fds);
+    if (rustls_connection_wants_read(rconn)) {
+      FD_SET(sockfd, &read_fds);
+    }
     FD_ZERO(&write_fds);
-    FD_SET(sockfd, &write_fds);
+    if (rustls_connection_wants_write(rconn)) {
+      FD_SET(sockfd, &write_fds);
+    }
 
     result = select(sockfd + 1, &read_fds, &write_fds, NULL, NULL);
     if(result == -1) {
@@ -249,16 +256,15 @@ send_request_and_read_response(struct conndata_t *conn,
       goto cleanup;
     }
 
-    if(rustls_connection_wants_read(client_conn) &&
-       FD_ISSET(sockfd, &read_fds)) {
+    if(FD_ISSET(sockfd, &read_fds)) {
       fprintf(stderr,
-              "ClientSession wants us to read_tls. First we need to pull some "
+              "rustls_connection wants us to read_tls. First we need to pull some "
               "bytes from the socket\n");
 
       /* Read all bytes until we get EAGAIN. Then loop again to wind up in
          select awaiting the next bit of data. */
       for(;;) {
-        result = do_read(conn, client_conn);
+        result = do_read(conn, rconn);
         if(result == CRUSTLS_DEMO_AGAIN) {
           break;
         }
@@ -269,19 +275,48 @@ send_request_and_read_response(struct conndata_t *conn,
         else if(result != CRUSTLS_DEMO_OK) {
           goto cleanup;
         }
+        if(headerslen == 0) {
+          body = body_begin(&conn->data);
+          if(body != NULL) {
+            headerslen = body - conn->data.data;
+            fprintf(stderr, "body began at %ld\n", headerslen);
+            contentlengthstr = get_first_header_value(conn->data.data, headerslen,
+              "Content-Length", &n);
+            if(contentlengthstr == NULL) {
+              fprintf(stderr, "content length header not found\n");
+              goto cleanup;
+            }
+            contentlength = strtoul(contentlengthstr, (char**)&contentlengthend, 10);
+            if(contentlengthend == contentlengthstr) {
+              fprintf(stderr, "invalid Content-Length '%.*s'\n", (int)n, contentlengthstr);
+              goto cleanup;
+            }
+            fprintf(stderr, "content length %ld\n", contentlength);
+          }
+        }
+        if(headerslen != 0 && conn->data.len >= headerslen + contentlength) {
+          /* body is done. */
+          write(STDERR_FILENO, conn->data.data, conn->data.len);
+          ret = 0;
+          goto cleanup;
+        }
       }
     }
-    if(rustls_connection_wants_write(client_conn) &&
-       FD_ISSET(sockfd, &write_fds)) {
-      fprintf(stderr, "ClientSession wants us to write_tls.\n");
-      err = rustls_connection_write_tls(client_conn, write_cb, conn, &n);
-      if(err != 0) {
-        fprintf(stderr, "Error in ClientSession::write_tls: errno %d\n", err);
-        goto cleanup;
-      }
-      else if(n == 0) {
-        fprintf(stderr, "EOF from ClientSession::write_tls\n");
-        goto cleanup;
+    if(FD_ISSET(sockfd, &write_fds)) {
+      fprintf(stderr, "rustls_connection wants us to write_tls.\n");
+      for(;;) {
+        err = rustls_connection_write_tls(rconn, write_cb, conn, &n);
+        if(err != 0) {
+          fprintf(stderr, "Error in rustls_connection_write_tls: errno %d\n", err);
+          goto cleanup;
+        }
+        if(result == CRUSTLS_DEMO_AGAIN) {
+          break;
+        }
+        else if(n == 0) {
+          fprintf(stderr, "write 0 from rustls_connection_write_tls\n");
+          break;
+        }
       }
     }
   }
@@ -299,7 +334,7 @@ int
 do_request(const struct rustls_client_config *client_config,
            const char *hostname, const char *port, const char *path)
 {
-  struct rustls_connection *client_conn = NULL;
+  struct rustls_connection *rconn = NULL;
   struct conndata_t *conn = NULL;
   int ret = 1;
   int sockfd = make_conn(hostname, port);
@@ -308,23 +343,24 @@ do_request(const struct rustls_client_config *client_config,
     goto cleanup;
   }
 
-  conn = calloc(1, sizeof(struct conndata_t));
-  if(conn == NULL) {
-    goto cleanup;
-  }
-  conn->fd = sockfd;
-  conn->verify_arg = "verify_arg";
-
   rustls_result result =
-    rustls_client_connection_new(client_config, hostname, &client_conn);
+    rustls_client_connection_new(client_config, hostname, &rconn);
   if(result != RUSTLS_RESULT_OK) {
     print_error("client_connection_new", result);
     goto cleanup;
   }
 
-  rustls_connection_set_userdata(client_conn, conn);
+  conn = calloc(1, sizeof(struct conndata_t));
+  if(conn == NULL) {
+    goto cleanup;
+  }
+  conn->rconn = rconn;
+  conn->fd = sockfd;
+  conn->verify_arg = "verify_arg";
 
-  ret = send_request_and_read_response(conn, client_conn, hostname, path);
+  rustls_connection_set_userdata(rconn, conn);
+
+  ret = send_request_and_read_response(conn, rconn, hostname, path);
   if(ret != RUSTLS_RESULT_OK) {
     goto cleanup;
   }
@@ -332,7 +368,7 @@ do_request(const struct rustls_client_config *client_config,
   ret = 0;
 
 cleanup:
-  rustls_connection_free(client_conn);
+  rustls_connection_free(rconn);
   if(sockfd > 0) {
     close(sockfd);
   }

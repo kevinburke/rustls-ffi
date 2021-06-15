@@ -20,11 +20,11 @@ ifeq ($(PROFILE), release)
 	CARGOFLAGS += --release
 endif
 
-all: target/crustls-demo
+all: target/client target/server
 
 test: all
 	cargo test
-	target/client httpbin.org 443 /headers
+	./test.sh
 
 target:
 	mkdir -p $@

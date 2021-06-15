@@ -64,57 +64,6 @@ read_file(const char *filename, char *buf, size_t buflen, size_t *n)
   return CRUSTLS_DEMO_OK;
 }
 
-/* Read all available bytes from the rustls_connection until EOF.
- * Note that EOF here indicates "no more bytes until
- * process_new_packets", not "stream is closed".
- *
- * Returns CRUSTLS_DEMO_OK for success,
- * CRUSTLS_DEMO_ERROR for error,
- * CRUSTLS_DEMO_CLOSE_NOTIFY for "received close_notify"
- */
-int
-copy_plaintext_to_buffer(struct conndata_t *conn)
-{
-  int result;
-  size_t n;
-  struct rustls_connection *rconn = conn->rconn;
-
-  if (conn->data_capacity - conn->data_len < 1024) {
-    conn->data_from_client = realloc(conn->data_from_client,
-      conn->data_capacity * 2);
-    if (conn->data_from_client == NULL) {
-      fprintf(stderr, "out of memory\n");
-      abort();
-    }
-  }
-
-  for(;;) {
-    char *buf = conn->data_from_client + conn->data_len;
-    size_t avail = conn->data_capacity - conn->data_len - 1;
-    result = rustls_connection_read(rconn, (uint8_t *)buf, avail, &n);
-    if(result == RUSTLS_RESULT_ALERT_CLOSE_NOTIFY) {
-      fprintf(stderr, "Received close_notify, cleanly ending connection\n");
-      return CRUSTLS_DEMO_CLOSE_NOTIFY;
-    }
-    if(result != RUSTLS_RESULT_OK) {
-      fprintf(stderr, "Error in ClientSession::read\n");
-      return CRUSTLS_DEMO_ERROR;
-    }
-    if(n == 0) {
-      /* This is expected. It just means "no more bytes for now." */
-      return CRUSTLS_DEMO_OK;
-    }
-    conn->data_len += n;
-
-    result = write_all(STDOUT_FILENO, buf, n);
-    if(result != 0) {
-      return CRUSTLS_DEMO_ERROR;
-    }
-  }
-
-  return CRUSTLS_DEMO_ERROR;
-}
-
 typedef enum exchange_state {
   READING_REQUEST,
   SENT_RESPONSE
@@ -177,18 +126,12 @@ do_read(struct conndata_t *conn, struct rustls_connection *rconn)
   return CRUSTLS_DEMO_CLOSE_NOTIFY;
 }
 
-bool
-request_is_finished(struct conndata_t *conn) {
-   conn->data_from_client[conn->data_len] = 0;
-   return strstr(conn->data_from_client, "\r\n\r\n") != NULL;
-}
-
 void
 send_response(struct conndata_t *conn) {
   struct rustls_connection *rconn = conn->rconn;
   const char* response = "HTTP/1.1 200 OK\r\nContent-Length: 6\r\n\r\nhello\n";
   size_t n;
-  rustls_connection_write(rconn, response, strlen(response), &n);
+  rustls_connection_write(rconn, (const uint8_t *)response, strlen(response), &n);
   if (n != strlen(response)) {
     fprintf(stderr, "failed to write all response bytes. wrote %ld\n", n);
     abort();
@@ -197,10 +140,8 @@ send_response(struct conndata_t *conn) {
 
 void *
 handle_conn(void *userdata) {
-  int ret = 1;
   int err = 1;
   int result = 1;
-  char buf[2048];
   fd_set read_fds;
   fd_set write_fds;
   size_t n = 0;
@@ -247,7 +188,6 @@ handle_conn(void *userdata) {
           break;
         }
         else if(result == CRUSTLS_DEMO_CLOSE_NOTIFY) {
-          ret = 0;
           goto cleanup;
         }
         else if(result != CRUSTLS_DEMO_OK) {
@@ -268,7 +208,7 @@ handle_conn(void *userdata) {
       }
     }
 
-    if (state == READING_REQUEST && request_is_finished(conn)) {
+    if (state == READING_REQUEST && body_begin(&conn->data) != NULL) {
       state = SENT_RESPONSE;
       fprintf(stderr, "writing response\n");
       send_response(conn);
@@ -281,6 +221,34 @@ cleanup:
   if(sockfd > 0) {
     close(sockfd);
   }
+  return NULL;
+}
+
+const struct rustls_certified_key *
+load_cert_and_key(const char* certfile, const char *keyfile) {
+  char certbuf[10000];
+  size_t certbuf_len;
+  char keybuf[10000];
+  size_t keybuf_len;
+
+  int result = read_file(certfile, certbuf, sizeof(certbuf), &certbuf_len);
+  if(result != CRUSTLS_DEMO_OK) {
+    return NULL;
+  }
+
+  result = read_file(keyfile, keybuf, sizeof(keybuf), &keybuf_len);
+  if(result != CRUSTLS_DEMO_OK) {
+    return NULL;
+  }
+
+  const struct rustls_certified_key *certified_key;
+  result = rustls_certified_key_build(
+    (uint8_t*)certbuf, certbuf_len, (uint8_t*)keybuf, keybuf_len, &certified_key);
+  if(result != RUSTLS_RESULT_OK) {
+    print_error("parsing certificate and key", result);
+    return NULL;
+  }
+  return certified_key;
 }
 
 int
@@ -290,10 +258,6 @@ main(int argc, const char **argv)
   int result = 1;
   const char *certfile = argv[1];
   const char *keyfile = argv[2];
-  char certbuf[10000];
-  size_t certbuf_len;
-  char keybuf[10000];
-  size_t keybuf_len;
   struct rustls_server_config_builder *config_builder =
     rustls_server_config_builder_new();
   const struct rustls_server_config *server_config = NULL;
@@ -307,22 +271,10 @@ main(int argc, const char **argv)
     goto cleanup;
   }
 
-  result = read_file(certfile, certbuf, sizeof(certbuf), &certbuf_len);
-  if(result != CRUSTLS_DEMO_OK) {
+  const struct rustls_certified_key *certified_key =
+    load_cert_and_key(certfile, keyfile);
+  if(certified_key == NULL) {
     goto cleanup;
-  }
-
-  result = read_file(keyfile, keybuf, sizeof(keybuf), &keybuf_len);
-  if(result != CRUSTLS_DEMO_OK) {
-    goto cleanup;
-  }
-
-  const struct rustls_certified_key *certified_key;
-  result = rustls_certified_key_build(
-    certbuf, certbuf_len, keybuf, keybuf_len, &certified_key);
-  if(result != RUSTLS_RESULT_OK) {
-    print_error("parsing certificate and key", result);
-    return 1;
   }
 
   rustls_server_config_builder_set_certified_keys(config_builder, &certified_key, 1);
@@ -380,8 +332,6 @@ main(int argc, const char **argv)
     conndata = calloc(1, sizeof(conndata_t));
     conndata->fd = clientfd;
     conndata->rconn = rconn;
-    conndata->data_from_client = calloc(1, 2048);
-    conndata->data_capacity = 2048;
     ret = pthread_create(&thrd, NULL, handle_conn, conndata);
     if (ret != 0) {
       fprintf(stderr, "error from pthread_create: %d\n", ret);
@@ -406,3 +356,4 @@ cleanup:
 
   return ret;
 }
+
