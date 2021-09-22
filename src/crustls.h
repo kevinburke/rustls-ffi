@@ -121,7 +121,7 @@ typedef struct rustls_certified_key rustls_certified_key;
 
 /**
  * A verifier of client certificates that requires all certificates to be
- * trusted based on a given`rustls_root_cert_store`. Usable in building server
+ * trusted based on a given `rustls_root_cert_store`. Usable in building server
  * configurations. Connections without such a client certificate will not
  * be accepted.
  */
@@ -490,6 +490,15 @@ enum rustls_result rustls_certificate_get_der(const struct rustls_certificate *c
  * The bytes from the assignment are interpreted in network order.
  */
 uint16_t rustls_supported_ciphersuite_get_suite(const struct rustls_supported_ciphersuite *supported_ciphersuite);
+
+/**
+ * Write the name of the ciphersuite into the provided buffer, up to a max of
+ * `len` bytes. Output is NUL terminated. Return the number of bytes written
+ * before the NUL.
+ */
+size_t rustls_supported_ciphersuite_get_name(const struct rustls_supported_ciphersuite *supported_ciphersuite,
+                                             char *buf,
+                                             size_t len);
 
 /**
  * Return the length of rustls' list of supported cipher suites.

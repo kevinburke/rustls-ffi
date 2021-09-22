@@ -1,4 +1,5 @@
-use libc::size_t;
+use libc::{c_char, size_t};
+use std::cmp::min;
 use std::io::Cursor;
 use std::ptr::null;
 use std::slice;
@@ -84,6 +85,30 @@ pub extern "C" fn rustls_supported_ciphersuite_get_suite(
 ) -> u16 {
     let supported_ciphersuite = try_ref_from_ptr!(supported_ciphersuite);
     supported_ciphersuite.suite.get_u16()
+}
+
+/// Write the name of the ciphersuite into the provided buffer, up to a max of
+/// `len` bytes. Output is NUL terminated. Return the number of bytes written
+/// before the NUL.
+#[no_mangle]
+pub extern "C" fn rustls_supported_ciphersuite_get_name(
+    supported_ciphersuite: *const rustls_supported_ciphersuite,
+    buf: *mut c_char,
+    len: size_t,
+) -> size_t {
+    let write_buf: &mut [u8] = unsafe {
+        if buf.is_null() {
+            return 0;
+        }
+        slice::from_raw_parts_mut(buf as *mut u8, len as usize)
+    };
+    let supported_ciphersuite = try_ref_from_ptr!(supported_ciphersuite);
+    let suite_name: String = format!("{:?}", supported_ciphersuite);
+    let suite_name: &[u8] = suite_name.as_bytes();
+    let len: usize = min(write_buf.len() - 1, suite_name.len());
+    write_buf[..len].copy_from_slice(&suite_name[..len]);
+    write_buf[len] = 0;
+    len
 }
 
 /// Return the length of rustls' list of supported cipher suites.
