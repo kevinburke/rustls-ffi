@@ -1,9 +1,9 @@
 use libc::{c_char, size_t};
-use std::cmp::min;
 use std::io::Cursor;
 use std::ptr::null;
 use std::slice;
 use std::sync::Arc;
+use std::io::Write;
 
 use rustls::sign::CertifiedKey;
 use rustls::{
@@ -96,19 +96,31 @@ pub extern "C" fn rustls_supported_ciphersuite_get_name(
     buf: *mut c_char,
     len: size_t,
 ) -> size_t {
-    let write_buf: &mut [u8] = unsafe {
+    println!("input len: {}", len);
+    let mut write_buf: &mut [u8] = unsafe {
         if buf.is_null() {
             return 0;
         }
         slice::from_raw_parts_mut(buf as *mut u8, len as usize)
     };
     let supported_ciphersuite = try_ref_from_ptr!(supported_ciphersuite);
-    let suite_name: String = format!("{:?}", supported_ciphersuite);
-    let suite_name: &[u8] = suite_name.as_bytes();
-    let len: usize = min(write_buf.len() - 1, suite_name.len());
-    write_buf[..len].copy_from_slice(&suite_name[..len]);
-    write_buf[len] = 0;
-    len
+    let a = write!(write_buf, "{:?}aaaaaa\0", supported_ciphersuite.suite).unwrap();
+    println!("a: {:?}", a);
+    println!("buflen: {}", write_buf.len());
+    println!("buf: {:?}", write_buf);
+    write_buf.len()
+}
+
+#[test]
+fn test_ciphersuite_name() {
+    let suite = rustls::ALL_CIPHERSUITES[0] as *const SupportedCipherSuite as *const _;
+    let bytes = (0..100).map(|_| "\0").collect::<String>().into_bytes();
+    let mut c_chars: Vec<i8> = bytes.iter().map(| c | *c as i8).collect::<Vec<i8>>();
+    c_chars.push(0); // null terminator
+    let buf: *mut c_char = c_chars.as_mut_ptr();
+    println!("bytelen: {}", bytes.len());
+    let wrote = rustls_supported_ciphersuite_get_name(suite, buf, bytes.len());
+    assert_eq!(wrote, 45)
 }
 
 /// Return the length of rustls' list of supported cipher suites.
