@@ -1,4 +1,5 @@
 use libc::{c_char, size_t};
+use std::ffi::CString;
 use std::io::Cursor;
 use std::ptr::null;
 use std::slice;
@@ -114,12 +115,10 @@ pub extern "C" fn rustls_supported_ciphersuite_get_name(
 #[test]
 fn test_ciphersuite_name() {
     let suite = rustls::ALL_CIPHERSUITES[0] as *const SupportedCipherSuite as *const _;
-    let bytes = (0..100).map(|_| "\0").collect::<String>().into_bytes();
-    let mut c_chars: Vec<i8> = bytes.iter().map(| c | *c as i8).collect::<Vec<i8>>();
-    c_chars.push(0); // null terminator
-    let buf: *mut c_char = c_chars.as_mut_ptr();
-    println!("bytelen: {}", bytes.len());
-    let wrote = rustls_supported_ciphersuite_get_name(suite, buf, bytes.len());
+    let nullbytes = (0..100).map(|_| "\0").collect::<String>();
+    let cstring = CString::new(nullbytes).unwrap();
+    let c_chars: *mut c_char = cstring.as_mut_ptr() as *mut c_char;
+    let wrote = rustls_supported_ciphersuite_get_name(suite, c_chars, cstring.len());
     assert_eq!(wrote, 45)
 }
 
